@@ -1434,34 +1434,62 @@ def phase_launch(ctx: Ctx, keys: List[str], count: int, buy_usdc_str: str,
 def phase_trade(ctx: Ctx, keys: List[str], token: Optional[str],
                 lo: int, hi: int, extra_tokens: Optional[List[str]] = None,
                 chunk_size: int = 50):
-    info(f"=== STREAMING TRADE ($ {lo} - ${hi} in {chunk_size}-wallet JIT streams) ===")
-    tokens = []
-    if token:
-        tokens = [token]
-    else:
-        if extra_tokens:
-            tokens.extend([t for t in extra_tokens if t not in tokens])
-        deploy_addrs = [d["address"] for d in reversed(ctx.state.get("deployments", [])) if d.get("address")]
-        for d in deploy_addrs:
-            if d not in tokens:
-                tokens.append(d)
-        live_tokens = fetch_flipt_newest_tokens(limit=60)
-        for lt in live_tokens:
-            if lt not in tokens:
-                tokens.append(lt)
+    info(f"=== DYNAMIC STREAMING TRADE ($ {lo} - ${hi} in {chunk_size}-wallet JIT streams) ===")
+    
+    last_refresh = 0.0
+    active_pool: List[str] = []
 
-    if not tokens:
-        warn("no tokens to trade (launch first, or pass --token)")
+    def refresh_token_pool():
+        nonlocal last_refresh, active_pool
+        pool = []
+        if token:
+            pool = [token]
+        else:
+            # 1. Newly deployed tokens in current cycle have highest priority
+            if extra_tokens:
+                for t in extra_tokens:
+                    if t and t not in pool:
+                        pool.append(t)
+            # 2. Add recent deployments from local state (newest first)
+            deploy_addrs = [d["address"] for d in reversed(ctx.state.get("deployments", [])) if d.get("address")]
+            for d in deploy_addrs:
+                if d not in pool:
+                    pool.append(d)
+            # 3. Pull live newest active bonding tokens from Flipt API (room to buy < $6,200)
+            live_tokens = fetch_flipt_newest_tokens(limit=60)
+            for lt in live_tokens:
+                if lt not in pool:
+                    pool.append(lt)
+        active_pool = pool
+        last_refresh = time.time()
+        return active_pool
+
+    # Initial pool population
+    refresh_token_pool()
+    if not active_pool:
+        warn("no tokens in active pool to trade (launch first, or pass --token)")
         return
-    info(f"Targeting {len(tokens)} active tokens across {len(keys)} wallets")
+    info(f"Active token pool initialized with {len(active_pool)} tokens (Newest: {active_pool[0][:12]}..)")
 
     min_wei = MIN_COST_BASIS_USDC * 10**USDC_DECIMALS
     results = {"sent": 0, "skip-funds": 0, "skip-allowance": 0, "error": 0}
     all_hashes: List[str] = []
 
-    # Stream through wallets in 50-wallet JIT chunks
     total_chunks = (len(keys) + chunk_size - 1) // chunk_size
     for chunk_idx, i in enumerate(range(0, len(keys), chunk_size)):
+        # Dynamic Token Pool Refresh: check every 45 seconds for newly launched tokens
+        if time.time() - last_refresh > 45 or not active_pool:
+            prev_len = len(active_pool)
+            refresh_token_pool()
+            info(f"Dynamic token pool refreshed: {len(active_pool)} active tokens (prev: {prev_len})")
+
+        if not active_pool:
+            warn("all token bonding curves currently capped; waiting for new launches...")
+            time.sleep(10)
+            refresh_token_pool()
+            if not active_pool:
+                break
+
         chunk_keys = keys[i:i + chunk_size]
         chunk_addrs = [Account.from_key(k).address for k in chunk_keys]
 
@@ -1494,7 +1522,14 @@ def phase_trade(ctx: Ctx, keys: List[str], token: Optional[str],
             if amount_wei > usdc:
                 amount_wei = max(min_wei, usdc // 2)
 
-            tgt = random.choice(tokens)
+            # Random selection with priority weighting on the newest tokens in the pool
+            if len(active_pool) > 5 and random.random() < 0.80:
+                # 80% chance: randomly select from the top 10 newest tokens
+                tgt = random.choice(active_pool[:min(10, len(active_pool))])
+            else:
+                # 20% chance: randomly select across the wider pool for broad volume distribution
+                tgt = random.choice(active_pool)
+
             if row.get("allowance", 0) < amount_wei:
                 d = bytes.fromhex(SEL["approve"]) + encode(
                     ["address", "uint256"], [ROUTER, MAX_UINT])
