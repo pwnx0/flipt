@@ -97,13 +97,373 @@ from eth_abi import encode, decode
 from eth_account import Account
 from eth_utils import keccak
 
-try:
-    from flipt_rpc_fast import FastRpc, MULTICALL3, USDC as USDC_ADDR
-except ImportError:
-    raise SystemExit(
-        "flipt_rpc_fast.py not found. Copy it next to this file.\n"
-        "(It needs the real 443-line arc_rpc_pool.py, not the 60-line one.)"
-    )
+MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+# ===========================================================================
+# RPC POOL & RATE LIMITER (Zero External File Dependencies)
+# ===========================================================================
+VERIFIED_ENDPOINTS = [
+    "https://rpc.testnet.arc.network",
+    "https://rpc.testnet.arc.io",
+    "https://arc-testnet.drpc.org",
+    "https://rpc.quicknode.testnet.arc.io",
+    "https://rpc.drpc.testnet.arc.io",
+    "https://rpc.blockdaemon.testnet.arc.io:443",
+]
+
+@dataclass
+class Endpoint:
+    url: str
+    success_count: int = 0
+    failure_count: int = 0
+    total_latency_ms: float = 0.0
+    cooldown_until: float = 0.0
+    waf_banned: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def avg_latency_ms(self) -> float:
+        return (self.total_latency_ms / self.success_count) if self.success_count > 0 else 100.0
+
+    def is_healthy(self) -> bool:
+        return (not self.waf_banned) and (time.monotonic() >= self.cooldown_until)
+
+    def note_success(self, latency_ms: float):
+        with self._lock:
+            self.success_count += 1
+            self.total_latency_ms += latency_ms
+
+    def note_failure(self, cooldown: float = 5.0, waf: bool = False):
+        with self._lock:
+            self.failure_count += 1
+            if waf:
+                self.waf_banned = True
+                self.cooldown_until = time.monotonic() + 300.0
+            else:
+                self.cooldown_until = time.monotonic() + cooldown
+
+
+class ArcRpcPool:
+    def __init__(self, endpoints: Optional[List[str]] = None, verify_chain: bool = False, timeout: float = 30.0):
+        urls = endpoints or VERIFIED_ENDPOINTS
+        self.endpoints = [Endpoint(url=u) for u in urls]
+        self.timeout = timeout
+        self.headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        if verify_chain:
+            self._verify_chain()
+
+    def _verify_chain(self):
+        try:
+            cid = int(self.call("eth_chainId"), 16)
+            if cid != CHAIN_ID:
+                raise ValueError(f"Refusing to send on wrong chain ID {cid} (expected {CHAIN_ID})")
+        except Exception:
+            pass
+
+    def healthy(self) -> List[Endpoint]:
+        h = [ep for ep in self.endpoints if ep.is_healthy()]
+        return h if h else self.endpoints
+
+    def _pick(self) -> Endpoint:
+        h = self.healthy()
+        h.sort(key=lambda e: e.avg_latency_ms)
+        if len(h) > 1 and random.random() > 0.75:
+            return random.choice(h[1:])
+        return h[0]
+
+    def get_web3(self):
+        from web3 import Web3
+        ep = self._pick()
+        return Web3(Web3.HTTPProvider(ep.url, request_kwargs={"timeout": self.timeout, "headers": self.headers}))
+
+    def call(self, method: str, params: Optional[List[Any]] = None, attempts: int = 5) -> Any:
+        import urllib.request
+        import urllib.error
+        params = params or []
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+        last_err = None
+
+        for attempt in range(attempts):
+            ep = self._pick()
+            req = urllib.request.Request(ep.url, data=body, headers=self.headers)
+            t0 = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                latency = (time.perf_counter() - t0) * 1000.0
+                ep.note_success(latency)
+                if "result" in data:
+                    return data["result"]
+                elif "error" in data:
+                    err_code = data["error"].get("code", 0)
+                    if err_code in (-32005, -32011):
+                        ep.note_failure(cooldown=5.0)
+                    raise RuntimeError(f"RPC Error: {data['error']}")
+            except urllib.error.HTTPError as e:
+                last_err = e
+                detail = e.read()[:120].decode(errors="replace")
+                if e.code == 429:
+                    ep.note_failure(cooldown=5.0)
+                elif e.code == 403 and "1010" in detail:
+                    ep.note_failure(waf=True)
+                else:
+                    ep.note_failure(cooldown=2.0)
+                time.sleep(0.15 * (attempt + 1))
+            except Exception as e:
+                last_err = e
+                ep.note_failure(cooldown=2.0)
+                time.sleep(0.15 * (attempt + 1))
+
+        raise RuntimeError(f"All {attempts} attempts failed for {method}: {last_err}")
+
+    def report(self) -> str:
+        lines = ["ArcRpcPool Endpoint Status:"]
+        for ep in self.endpoints:
+            status = "WAF_BANNED" if ep.waf_banned else ("COOLDOWN" if not ep.is_healthy() else "HEALTHY")
+            lines.append(
+                f"  {ep.url:<44} [{status:<10}] "
+                f"lat: {ep.avg_latency_ms:>5.1f}ms | ok: {ep.success_count:>4} | fail: {ep.failure_count:>3}"
+            )
+        return "\n".join(lines)
+
+
+class TokenBucket:
+    def __init__(self, rate_per_sec: float = 25.0, burst: Optional[float] = None):
+        self.rate = float(rate_per_sec)
+        self.capacity = float(burst if burst is not None else max(10.0, rate_per_sec))
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self._lock = threading.Lock()
+        self.waits = 0
+
+    def acquire(self, n: float = 1.0) -> float:
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self.tokens = min(
+                    self.capacity, self.tokens + (now - self.updated) * self.rate
+                )
+                self.updated = now
+                if self.tokens >= n:
+                    self.tokens -= n
+                    if waited:
+                        self.waits += 1
+                    return waited
+                deficit = n - self.tokens
+                sleep_for = deficit / self.rate
+            time.sleep(min(sleep_for, 1.0))
+            waited += min(sleep_for, 1.0)
+
+
+class FastRpc:
+    def __init__(
+        self,
+        pool: Optional[ArcRpcPool] = None,
+        rate_per_sec: float = 25.0,
+        gas_price_wei: int = 21_000_000_000,
+        timeout: float = 30.0,
+    ):
+        self.timeout = timeout
+        self.pool = pool or ArcRpcPool(verify_chain=True, timeout=timeout)
+        self.bucket = TokenBucket(rate_per_sec)
+        self._gas_price = gas_price_wei
+        self._gas_checked = 0.0
+        self.counters = {
+            "http_requests": 0,
+            "batch_requests": 0,
+            "rate_limit_waits": 0,
+            "gas_price_reads": 0,
+            "http_429": 0,
+            "waf_403": 0,
+            "batch_sends": 0,
+            "nonce_fallback_ok": 0,
+            "nonce_fallback_fail": 0,
+        }
+        self._lock = threading.Lock()
+
+    def bump(self, key: str, n: int = 1):
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + n
+
+    def call(self, method: str, params: Optional[list] = None, attempts: int = 5):
+        waited = self.bucket.acquire()
+        if waited:
+            self.bump("rate_limit_waits")
+        self.bump("http_requests")
+        return self.pool.call(method, params or [], attempts=attempts)
+
+    def batch_call(self, requests: Sequence[Tuple[str, list]]) -> List[Any]:
+        import urllib.request
+        import urllib.error
+        if not requests:
+            return []
+        self.bucket.acquire()
+        self.bump("batch_requests")
+        self.bump("http_requests")
+
+        payload = [
+            {"jsonrpc": "2.0", "id": i, "method": m, "params": p}
+            for i, (m, p) in enumerate(requests)
+        ]
+        body = json.dumps(payload).encode()
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            ep = self.pool._pick()
+            req = urllib.request.Request(
+                ep.url, data=body, headers=self.pool.headers
+            )
+            t0 = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                ep.note_success((time.perf_counter() - t0) * 1000)
+
+                # Robust handling of single-dict error responses
+                if isinstance(data, dict):
+                    if "error" in data:
+                        raise RuntimeError(f"RPC batch error: {data['error']}")
+                    data = [data]
+
+                out: List[Any] = [None] * len(requests)
+                for item in data:
+                    if isinstance(item, dict):
+                        if "result" in item:
+                            out[item["id"]] = item["result"]
+                        elif "error" in item:
+                            out[item["id"]] = None
+                return out
+            except urllib.error.HTTPError as e:
+                detail = e.read()[:120].decode(errors="replace")
+                if e.code == 429:
+                    self.bump("http_429")
+                    ep.note_failure(cooldown=5.0)
+                elif e.code == 403 and "1010" in detail:
+                    self.bump("waf_403")
+                    ep.note_failure(waf=True)
+                else:
+                    ep.note_failure()
+                last_exc = e
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                delay = float(retry_after) if (retry_after or "").isdigit() else 0.5 * (2 ** attempt)
+                time.sleep(min(delay, 10.0) + random.random() * 0.3)
+            except Exception as e:
+                ep.note_failure()
+                last_exc = e
+                time.sleep(0.3 * (2 ** attempt) + random.random() * 0.3)
+
+        raise RuntimeError(f"batch of {len(requests)} failed on all endpoints: {last_exc}")
+
+    def gas_price(self) -> int:
+        now = time.time()
+        if now - self._gas_checked < 600:
+            return self._gas_price
+        try:
+            live = int(self.call("eth_gasPrice"), 16)
+            block = self.call("eth_getBlockByNumber", ["latest", False])
+            base = int(block["baseFeePerGas"], 16) if (block and "baseFeePerGas" in block) else 20_000_000_000
+            self._gas_price = max(live, base) + 750_000_000
+            self.bump("gas_price_reads")
+        except Exception:
+            pass
+        self._gas_checked = now
+        return self._gas_price
+
+    @staticmethod
+    def _addr_word(a: str) -> str:
+        return a[2:].lower().rjust(64, "0")
+
+    def preflight_batch(self, wallets: Sequence[str]) -> Dict[str, Dict[str, int]]:
+        calls = []
+        for w in wallets:
+            wd = self._addr_word(w)
+            calls.append((MULTICALL3, True, bytes.fromhex("4d2301cc" + wd)))
+            calls.append((USDC, True, bytes.fromhex("70a08231" + wd)))
+            calls.append((USDC, True, bytes.fromhex("dd62ed3e" + wd + self._addr_word(ROUTER))))
+
+        data = "0x82ad56cb" + encode(["(address,bool,bytes)[]"], [calls]).hex()
+        raw = self.call("eth_call", [{"to": MULTICALL3, "data": data}, "latest"])
+        results = decode(["(bool,bytes)[]"], bytes.fromhex(raw[2:]))[0]
+
+        out: Dict[str, Dict[str, int]] = {}
+        for i, w in enumerate(wallets):
+            native, usdc_bal, allow = results[i * 3], results[i * 3 + 1], results[i * 3 + 2]
+            out[w] = {
+                "native": int.from_bytes(native[1], "big") if native[1] else 0,
+                "usdc": int.from_bytes(usdc_bal[1], "big") if usdc_bal[1] else 0,
+                "allowance": int.from_bytes(allow[1], "big") if allow[1] else 0,
+            }
+        return out
+
+    def batch_nonces(self, wallets: Sequence[str]) -> Dict[str, int]:
+        reqs = [("eth_getTransactionCount", [w, "pending"]) for w in wallets]
+        res = self.batch_call(reqs)
+        out: Dict[str, int] = {}
+        for w, r in zip(wallets, res):
+            if isinstance(r, str):
+                out[w] = int(r, 16)
+            else:
+                try:
+                    single = self.call("eth_getTransactionCount", [w, "pending"])
+                    out[w] = int(single, 16)
+                    self.bump("nonce_fallback_ok")
+                except Exception:
+                    self.bump("nonce_fallback_fail")
+                    pass
+        return out
+
+    def batch_receipts(self, tx_hashes: Sequence[str]) -> Dict[str, Optional[dict]]:
+        if not tx_hashes:
+            return {}
+        reqs = [("eth_getTransactionReceipt", [h]) for h in tx_hashes]
+        res = self.batch_call(reqs)
+        out: Dict[str, Optional[dict]] = {}
+        for h, r in zip(tx_hashes, res):
+            out[h] = r if isinstance(r, dict) else None
+        return out
+
+    def batch_send_raw(self, signed_txs: Sequence[str]) -> List[Optional[str]]:
+        if not signed_txs:
+            return []
+        reqs = [("eth_sendRawTransaction", [tx]) for tx in signed_txs]
+        res = self.batch_call(reqs)
+        self.bump("batch_sends")
+        return [r if isinstance(r, str) else None for r in res]
+
+    def multicall(self, calls: Sequence[Tuple[str, bytes]]) -> List[bytes]:
+        """Generic Multicall3 aggregate3 execution.
+        calls: [(target_address, call_data_bytes), ...]
+        Returns: list of returnData bytes for each call (or b"" if failed).
+        """
+        if not calls:
+            return []
+        agg_calls = [(target, True, data) for target, data in calls]
+        data = "0x82ad56cb" + encode(["(address,bool,bytes)[]"], [agg_calls]).hex()
+        raw = self.call("eth_call", [{"to": MULTICALL3, "data": data}, "latest"])
+        if not raw or raw == "0x":
+            return [b""] * len(calls)
+        results = decode(["(bool,bytes)[]"], bytes.fromhex(raw[2:]))[0]
+        return [res[1] if res[0] else b"" for res in results]
+
+    def report(self) -> str:
+        c = self.counters
+        return (
+            f"FastRpc counters\n"
+            f"  http_requests      {c['http_requests']:>8,}\n"
+            f"  batch_requests     {c['batch_requests']:>8,}   (each replaces up to ~100 single calls)\n"
+            f"  batch_sends        {c.get('batch_sends', 0):>8,}\n"
+            f"  gas_price_reads    {c['gas_price_reads']:>8,}   (cached; would be 1/tx)\n"
+            f"  rate_limit_waits   {c['rate_limit_waits']:>8,}\n"
+            f"  nonce_fallback_ok  {c.get('nonce_fallback_ok', 0):>8,}\n"
+            f"  nonce_fallback_fail{c.get('nonce_fallback_fail', 0):>8,}\n"
+            f"  http_429           {c['http_429']:>8,}\n"
+            f"  waf_403            {c['waf_403']:>8,}\n"
+        )
+
 
 # ---------------------------------------------------------------------------
 # NETWORK
@@ -282,10 +642,12 @@ def save_state(state: dict):
         state["updated_at"] = int(time.time())
         try:
             DATA.mkdir(parents=True, exist_ok=True)
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
+            tmp_file = STATE_FILE.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, default=str)
                 f.flush()
                 os.fsync(f.fileno())
+            tmp_file.replace(STATE_FILE)
             _save_dirty.clear()
         except Exception as e:
             warn(f"state save failed: {e}")
@@ -601,8 +963,12 @@ class Sender:
         Each job is (acct, to_addr, data_bytes, gas_limit, label, meta_dict).
         Returns list of successfully broadcast tx hashes.
         """
-        if not self.send or not jobs:
-            return []
+        if not jobs:
+            return [], {}
+        if not self.send:
+            for acct, to, data, gas, label, meta in jobs:
+                log(f"{DIM}[dry-run batch]{RESET} {label:<34} {acct.address[:10]}.. to={to[:10]}..")
+            return [f"0xdry{i:060d}" for i in range(len(jobs))], {acct.address.lower(): f"0xdry{i:060d}" for i, (acct, _, _, _, _, _) in enumerate(jobs)}
 
         raw_txs = []
         nonces_used = []
@@ -627,7 +993,7 @@ class Sender:
                 err(f"batch_send sign failed {acct.address[:10]}: {str(e)[-80:]}")
 
         if not raw_txs:
-            return []
+            return [], {}
 
         try:
             results = self.rpc.batch_send_raw(raw_txs)
@@ -636,9 +1002,10 @@ class Sender:
             for acct, nonce, _, _ in nonces_used:
                 self.nonces.release(acct.address, nonce)
             err(f"batch_send_raw failed: {str(e)[-120:]}")
-            return []
+            return [], {}
 
         hashes = []
+        tx_by_wallet: Dict[str, str] = {}
         for (acct, nonce, label, meta), h in zip(nonces_used, results):
             if h:
                 self.nonces.commit(acct.address, nonce, h)
@@ -646,10 +1013,11 @@ class Sender:
                       status="broadcast", created_at=int(time.time()), **(meta or {}))
                 log(f"{GREEN}[batch]{RESET} {label:<34} {h[:18]}... nonce={nonce}")
                 hashes.append(h)
+                tx_by_wallet[acct.address.lower()] = h
             else:
                 self.nonces.release(acct.address, nonce)
                 warn(f"batch_send: no hash for {acct.address[:10]} nonce={nonce} ({label})")
-        return hashes
+        return hashes, tx_by_wallet
 
 
 
@@ -877,7 +1245,7 @@ def phase_preflight(ctx: Ctx, keys: List[str]) -> Dict[str, dict]:
     info(f"preflight {len(addrs)} wallets (Multicall3 + batched nonces)...")
 
     balances: Dict[str, dict] = {}
-    CHUNK = 200
+    CHUNK = 50  # 50 wallets = 150 Multicall3 items (avoids urlopen write timeout)
     for i in range(0, len(addrs), CHUNK):
         batch = addrs[i:i + CHUNK]
         try:
@@ -886,12 +1254,13 @@ def phase_preflight(ctx: Ctx, keys: List[str]) -> Dict[str, dict]:
             warn(f"preflight batch {i//CHUNK} failed: {str(e)[-80:]}")
 
     nonces: Dict[str, int] = {}
-    for i in range(0, len(addrs), CHUNK):
-        batch = addrs[i:i + CHUNK]
+    NONCE_CHUNK = 50  # 50 requests per JSON-RPC batch (avoids HTTP 500 error from RPC providers)
+    for i in range(0, len(addrs), NONCE_CHUNK):
+        batch = addrs[i:i + NONCE_CHUNK]
         try:
             nonces.update(ctx.rpc.batch_nonces(batch))
         except Exception as e:
-            warn(f"nonce batch {i//CHUNK} failed: {str(e)[-80:]}")
+            warn(f"nonce batch {i//NONCE_CHUNK} failed: {str(e)[-80:]}")
 
     ctx.nonces.seed_many(nonces)
 
@@ -947,10 +1316,35 @@ def phase_faucet(ctx: Ctx, keys: List[str]):
     info(f"faucet: {dict(Counter(results))}")
 
 
+
+def fetch_flipt_newest_tokens(limit: int = 60) -> List[str]:
+    """Fetch active tokens from Flipt board API that are in bonding phase with room to buy."""
+    import urllib.request
+    url = f"https://api-testnet.flipt.fun/board/newest?limit={limit}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            data = json.loads(resp.read().decode())
+        tokens = []
+        for r in data.get("rows", []):
+            tok = r.get("token")
+            phase = r.get("phase", "").lower()
+            raised = int(r.get("raised", 0)) / 1e6
+            grad = r.get("graduated", False)
+            # Room on bonding curve: phase is bonding, not graduated, raised < $6,200
+            if tok and phase == "bonding" and not grad and raised < 6200:
+                tokens.append(tok)
+        return tokens
+    except Exception as e:
+        warn(f"Flipt newest board API read failed (non-fatal): {e}")
+        return []
+
+
 def phase_launch(ctx: Ctx, keys: List[str], count: int, buy_usdc_str: str,
-                 tokens_per_wallet: int = 1):
+                 tokens_per_wallet: int = 1) -> List[str]:
     total = count * tokens_per_wallet
     info(f"=== LAUNCH ({count} creators × {tokens_per_wallet} tokens = {total} deploys) ===")
+    newly_deployed: List[str] = []
     catalog: List[dict] = []
     if CATALOG_FILE.exists():
         try:
@@ -958,7 +1352,24 @@ def phase_launch(ctx: Ctx, keys: List[str], count: int, buy_usdc_str: str,
         except Exception:
             pass
 
-    for idx, pk in enumerate(keys[:count]):
+    # JIT Preflight for JUST the creator wallets (runs in <0.5s, no cold start)
+    creator_keys = keys[:count]
+    creator_addrs = [Account.from_key(k).address for k in creator_keys]
+    info(f"JIT preflight for {len(creator_addrs)} creator wallets...")
+    try:
+        bals = ctx.rpc.preflight_batch(creator_addrs)
+        ncs = ctx.rpc.batch_nonces(creator_addrs)
+        ctx.nonces.seed_many(ncs)
+        for a in creator_addrs:
+            b = bals.get(a, {"native": 0, "usdc": 0, "allowance": 0})
+            wrow(ctx.state, a).update({
+                "native": b["native"], "usdc": b["usdc"], "allowance": b["allowance"],
+                "nonce": ncs.get(a, 0), "checked_at": int(time.time()),
+            })
+    except Exception as e:
+        warn(f"creator JIT preflight warning: {e}")
+
+    for idx, pk in enumerate(creator_keys):
         acct = Account.from_key(pk)
 
         for round_idx in range(tokens_per_wallet):
@@ -1013,93 +1424,120 @@ def phase_launch(ctx: Ctx, keys: List[str], count: int, buy_usdc_str: str,
                         })
                     wrow(ctx.state, acct.address).update({"last_token": predicted})
                     dirty()
+                    newly_deployed.append(predicted)
                 else:
                     warn(f"W{idx}R{round_idx} launch confirmation reverted or timed out")
+    info(f"phase_launch complete: {len(newly_deployed)} tokens deployed on-chain")
+    return newly_deployed
 
 
 def phase_trade(ctx: Ctx, keys: List[str], token: Optional[str],
-                lo: int, hi: int):
-    """
-    v3 read balance+allowance+nonce+gasPrice for every wallet individually
-    (5 calls each). Here balance/allowance come from the batched preflight and
-    gas price is cached, leaving essentially just the broadcast.
-    """
-    info("=== TRADE ===")
-    tokens = [d["address"] for d in ctx.state.get("deployments", []) if d.get("address")]
+                lo: int, hi: int, extra_tokens: Optional[List[str]] = None,
+                chunk_size: int = 50):
+    info(f"=== STREAMING TRADE ($ {lo} - ${hi} in {chunk_size}-wallet JIT streams) ===")
+    tokens = []
     if token:
         tokens = [token]
+    else:
+        if extra_tokens:
+            tokens.extend([t for t in extra_tokens if t not in tokens])
+        deploy_addrs = [d["address"] for d in reversed(ctx.state.get("deployments", [])) if d.get("address")]
+        for d in deploy_addrs:
+            if d not in tokens:
+                tokens.append(d)
+        live_tokens = fetch_flipt_newest_tokens(limit=60)
+        for lt in live_tokens:
+            if lt not in tokens:
+                tokens.append(lt)
+
     if not tokens:
         warn("no tokens to trade (launch first, or pass --token)")
         return
+    info(f"Targeting {len(tokens)} active tokens across {len(keys)} wallets")
 
     min_wei = MIN_COST_BASIS_USDC * 10**USDC_DECIMALS
     results = {"sent": 0, "skip-funds": 0, "skip-allowance": 0, "error": 0}
+    all_hashes: List[str] = []
 
-    def job(pk):
-        acct = Account.from_key(pk)
-        row = wrow(ctx.state, acct.address)
-        usdc = row.get("usdc", 0)
-        if usdc < min_wei:
-            results["skip-funds"] += 1
-            return
-        amount = random.randint(lo, hi)
-        amount_wei = amount * 10**USDC_DECIMALS
-        if amount_wei > usdc:
-            amount_wei = max(min_wei, usdc // 2)
+    # Stream through wallets in 50-wallet JIT chunks
+    total_chunks = (len(keys) + chunk_size - 1) // chunk_size
+    for chunk_idx, i in enumerate(range(0, len(keys), chunk_size)):
+        chunk_keys = keys[i:i + chunk_size]
+        chunk_addrs = [Account.from_key(k).address for k in chunk_keys]
 
-        tgt = random.choice(tokens)
-        if row.get("allowance", 0) < amount_wei:
-            d = bytes.fromhex(SEL["approve"]) + encode(
-                ["address", "uint256"], [ROUTER, MAX_UINT])
-            try:
-                h = ctx.sender.send_tx(acct, USDC, d, 80_000, "approve(usdc)")
-                if h:
-                    ctx.sender.wait(h)
-                    row["allowance"] = MAX_UINT
-            except Exception as e:
-                warn(f"{acct.address[:10]} approve failed: {str(e)[-70:]}")
-                results["skip-allowance"] += 1
-                return
+        # 1. JIT Preflight for this 50-wallet chunk (1 Multicall + 1 nonce batch, ~1s)
+        try:
+            balances = ctx.rpc.preflight_batch(chunk_addrs)
+            nonces = ctx.rpc.batch_nonces(chunk_addrs)
+            ctx.nonces.seed_many(nonces)
+            for a in chunk_addrs:
+                b = balances.get(a, {"native": 0, "usdc": 0, "allowance": 0})
+                wrow(ctx.state, a).update({
+                    "native": b["native"], "usdc": b["usdc"], "allowance": b["allowance"],
+                    "nonce": nonces.get(a, 0), "checked_at": int(time.time()),
+                })
+        except Exception as e:
+            warn(f"chunk {chunk_idx+1}/{total_chunks} JIT preflight failed: {e}")
+            continue
 
-        data = bytes.fromhex(SEL["buy"]) + encode(
-            ["address", "uint256", "uint256"], [tgt, amount_wei, 0])
-        return (acct, ROUTER, data, 320_000, f"buy {amount} USDC",
-                {"token": tgt, "amount_usdc": amount})
+        # 2. Build buy jobs for funded wallets in this chunk
+        buy_jobs = []
+        for pk in chunk_keys:
+            acct = Account.from_key(pk)
+            row = wrow(ctx.state, acct.address)
+            usdc = row.get("usdc", 0)
+            if usdc < min_wei or row.get("native", 0) < 10**14:
+                results["skip-funds"] += 1
+                continue
+            amount = random.randint(lo, hi)
+            amount_wei = amount * 10**USDC_DECIMALS
+            if amount_wei > usdc:
+                amount_wei = max(min_wei, usdc // 2)
 
-    # Collect buy jobs from all wallets
-    buy_jobs = []
-    with ThreadPoolExecutor(max_workers=ctx.workers) as pool:
-        raw_results = list(pool.map(job, keys))
-    for r in raw_results:
-        if isinstance(r, tuple) and len(r) == 6:
-            buy_jobs.append(r)
+            tgt = random.choice(tokens)
+            if row.get("allowance", 0) < amount_wei:
+                d = bytes.fromhex(SEL["approve"]) + encode(
+                    ["address", "uint256"], [ROUTER, MAX_UINT])
+                try:
+                    h = ctx.sender.send_tx(acct, USDC, d, 80_000, "approve(usdc)")
+                    if h:
+                        ctx.sender.wait(h, timeout=45)
+                        row["allowance"] = MAX_UINT
+                    elif not ctx.send:
+                        row["allowance"] = MAX_UINT
+                except Exception as e:
+                    warn(f"{acct.address[:10]} approve failed: {str(e)[-70:]}")
+                    results["skip-allowance"] += 1
+                    continue
 
-    if not buy_jobs:
-        info(f"trade: no buy jobs prepared. {results}")
-        return
+            data = bytes.fromhex(SEL["buy"]) + encode(
+                ["address", "uint256", "uint256"], [tgt, amount_wei, 0])
+            buy_jobs.append((acct, ROUTER, data, 320_000, f"buy {amount} USDC",
+                             {"token": tgt, "amount_usdc": amount}))
 
-    # Batch send in groups of 20 for throughput
-    BATCH_SIZE = 20
-    all_hashes = []
-    for i in range(0, len(buy_jobs), BATCH_SIZE):
-        batch = buy_jobs[i:i + BATCH_SIZE]
-        hashes = ctx.sender.batch_send(batch)
+        if not buy_jobs:
+            continue
+
+        # 3. Immediately broadcast this chunk's buy jobs
+        hashes, tx_by_wallet = ctx.sender.batch_send(buy_jobs)
         all_hashes.extend(hashes)
         results["sent"] += len(hashes)
-        # Record trades in state
-        for (acct, _, _, _, label, meta), h in zip(batch, hashes + [None] * (len(batch) - len(hashes))):
+
+        for (acct, _, _, _, label, meta) in buy_jobs:
+            h = tx_by_wallet.get(acct.address.lower())
             if h:
                 wrow(ctx.state, acct.address).setdefault("trades", []).append(
                     {"side": "buy", "token": meta["token"], "usdc": meta["amount_usdc"],
                      "tx": h, "ts": int(time.time())})
         dirty()
 
-    # Batch wait for confirmations in one pass
-    if all_hashes:
-        info(f"waiting for {len(all_hashes)} buy confirmations (batched)...")
-        ctx.sender.batch_wait(all_hashes[:500], timeout=120)
+        info(f"Chunk {chunk_idx+1}/{total_chunks}: sent {len(hashes)}/{len(buy_jobs)} buys (total: {results['sent']})")
 
-    info(f"trade: {results}")
+    if all_hashes and ctx.send:
+        info(f"waiting for {len(all_hashes)} buy confirmations (batched)...")
+        ctx.sender.batch_wait(all_hashes[:500], timeout=90)
+
+    info(f"trade complete: {results}")
 
 
 def phase_exit(ctx: Ctx, keys: List[str], tokens: Sequence[str], pct: float):
@@ -1243,8 +1681,8 @@ def main():
 
     ap.add_argument("--trade", action="store_true")
     ap.add_argument("--token", default=None)
-    ap.add_argument("--trade-min", type=int, default=250)
-    ap.add_argument("--trade-max", type=int, default=1000)
+    ap.add_argument("--trade-min", type=int, default=50)
+    ap.add_argument("--trade-max", type=int, default=100)
 
     ap.add_argument("--exit", action="store_true")
     ap.add_argument("--exit-tokens", nargs="*", default=[])
@@ -1290,24 +1728,20 @@ def main():
 
     try:
         def run_cycle(cycle_num: int = 1):
-            """One full preflight -> faucet -> launch -> trade cycle."""
             info(f"{'='*60}")
-            info(f"CYCLE {cycle_num} starting")
+            info(f"CYCLE {cycle_num} starting (Zero Cold-Start Streaming Mode)")
             info(f"{'='*60}")
 
-            phase_preflight(ctx, keys)
+            # 1. Launch with JIT creator preflight (starts in <1 second)
+            new_deployed = phase_launch(ctx, keys, args.launch_count, args.launch_buy,
+                                        args.tokens_per_wallet)
+            if new_deployed:
+                info(f"waiting 15s after deployment before buy wave on {len(new_deployed)} tokens...")
+                time.sleep(15)
 
-            phase_faucet(ctx, keys)
-            info("re-preflighting after faucet...")
-            time.sleep(15)
-            phase_preflight(ctx, keys)
-
-            phase_launch(ctx, keys, args.launch_count, args.launch_buy,
-                         args.tokens_per_wallet)
-            info("waiting for launches to confirm...")
-            time.sleep(20)
-
-            phase_trade(ctx, keys, None, args.trade_min, args.trade_max)
+            # 2. Streaming trade across wallets in 50-wallet JIT batches (continuous flow)
+            phase_trade(ctx, keys, None, args.trade_min, args.trade_max,
+                        extra_tokens=new_deployed, chunk_size=50)
 
             # Mid-cycle drain: catch receipts that arrived during the cycle
             pending = [h for h, m in state["transactions"].items()
