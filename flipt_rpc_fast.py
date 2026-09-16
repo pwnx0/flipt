@@ -242,6 +242,24 @@ class FastRpc:
             out[h] = r if isinstance(r, dict) else None
         return out
 
+
+    def multicall(self, calls: Sequence[Tuple[str, bytes]]) -> List[bytes]:
+        """Generic Multicall3 aggregate3 execution.
+        calls: [(target_address, call_data_bytes), ...]
+        Returns: list of returnData bytes for each call (or b"" if failed).
+        """
+        if not calls:
+            return []
+        agg_calls = [(target, True, data) for target, data in calls]
+        data = "0x" + SELECTOR_AGGREGATE3 + encode(
+            ["(address,bool,bytes)[]"], [agg_calls]
+        ).hex()
+        raw = self.call("eth_call", [{"to": MULTICALL3, "data": data}, "latest"])
+        if not raw or raw == "0x":
+            return [b""] * len(calls)
+        results = decode(["(bool,bytes)[]"], bytes.fromhex(raw[2:]))[0]
+        return [res[1] if res[0] else b"" for res in results]
+
     def batch_send_raw(self, signed_txs: Sequence[str]) -> List[Optional[str]]:
         """Send multiple signed raw txs in one HTTP batch. Returns list of tx hashes.
         Verified empirically: Arc testnet RPCs accept batched eth_sendRawTransaction."""
